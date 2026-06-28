@@ -1,0 +1,1320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Space Shooter</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #0a0a1a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: Arial, sans-serif;
+    }
+
+    h1 {
+      color: #ffffff;
+      font-size: 2.5rem;
+      letter-spacing: 4px;
+      text-transform: uppercase;
+      margin-bottom: 20px;
+    }
+
+    canvas {
+      display: block;
+      background: #000000;
+    }
+  </style>
+</head>
+<body>
+  <h1>Space Shooter</h1>
+  <canvas id="gameCanvas" width="1100" height="700"></canvas>
+
+  <script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // ── Audio (Web Audio API) ─────────────────────────────────────────────
+    const AC = new (window.AudioContext || window.webkitAudioContext)();
+
+    // Resume context on first user interaction (browser autoplay policy)
+    document.addEventListener('keydown', () => {
+      if (AC.state === 'suspended') AC.resume();
+    }, { once: true });
+
+    // ── BGM ───────────────────────────────────────────────────────────────
+    // A gentle, looping melodic theme built entirely with Web Audio.
+    // Inspired by soft Bollywood/romantic game BGM — slow melody over
+    // warm pad chords with a light pulse.
+
+    let bgmStarted = false;
+    let bgmMasterGain = null;   // exposed so we can mute/fade from outside
+    let bgmLoopActive = false;  // set to false to stop the loop scheduler
+
+    function startBGM() {
+      if (bgmStarted) return;
+      bgmStarted    = true;
+      bgmLoopActive = true;
+
+      const BPM      = 72;
+      const BEAT     = 60 / BPM;          // seconds per beat
+      const BAR      = BEAT * 4;          // 4/4 time
+      const LOOP_LEN = BAR * 8;           // 8-bar loop
+
+      // Master gain so BGM doesn't drown out SFX
+      const masterGain = AC.createGain();
+      masterGain.gain.value = 0.22;
+      masterGain.connect(AC.destination);
+      bgmMasterGain = masterGain; // expose for external control
+
+      // ── Soft reverb (convolver with synthetic impulse) ────────────────
+      function makeReverb(duration = 2.5, decay = 2.0) {
+        const len  = AC.sampleRate * duration;
+        const buf  = AC.createBuffer(2, len, AC.sampleRate);
+        for (let c = 0; c < 2; c++) {
+          const d = buf.getChannelData(c);
+          for (let i = 0; i < len; i++) {
+            d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+          }
+        }
+        const conv = AC.createConvolver();
+        conv.buffer = buf;
+        return conv;
+      }
+
+      const reverb     = makeReverb();
+      const reverbGain = AC.createGain();
+      reverbGain.gain.value = 0.45;
+      reverb.connect(reverbGain);
+      reverbGain.connect(masterGain);
+
+      // ── Helper: play a sine/triangle note ────────────────────────────
+      function playNote(freq, startTime, duration, vol = 0.18, type = 'sine') {
+        const osc  = AC.createOscillator();
+        const gain = AC.createGain();
+        osc.connect(gain);
+        gain.connect(masterGain);
+        gain.connect(reverb);
+
+        osc.type = type;
+        osc.frequency.value = freq;
+
+        const attack  = 0.04;
+        const release = Math.min(0.3, duration * 0.4);
+
+        gain.gain.setValueAtTime(0, startTime);
+        gain.gain.linearRampToValueAtTime(vol, startTime + attack);
+        gain.gain.setValueAtTime(vol, startTime + duration - release);
+        gain.gain.linearRampToValueAtTime(0, startTime + duration);
+
+        osc.start(startTime);
+        osc.stop(startTime + duration + 0.05);
+      }
+
+      // ── Helper: warm pad chord (multiple detuned sines) ──────────────
+      function playPad(freqs, startTime, duration, vol = 0.07) {
+        freqs.forEach((f, i) => {
+          const osc  = AC.createOscillator();
+          const gain = AC.createGain();
+          osc.connect(gain);
+          gain.connect(masterGain);
+          gain.connect(reverb);
+
+          osc.type = 'sine';
+          osc.frequency.value = f + (i % 2 === 0 ? 0.3 : -0.3); // slight detune
+
+          gain.gain.setValueAtTime(0, startTime);
+          gain.gain.linearRampToValueAtTime(vol, startTime + 0.3);
+          gain.gain.setValueAtTime(vol, startTime + duration - 0.4);
+          gain.gain.linearRampToValueAtTime(0, startTime + duration);
+
+          osc.start(startTime);
+          osc.stop(startTime + duration + 0.1);
+        });
+      }
+
+      // ── Helper: soft kick (sine thump) ───────────────────────────────
+      function playKick(startTime) {
+        const osc  = AC.createOscillator();
+        const gain = AC.createGain();
+        osc.connect(gain);
+        gain.connect(masterGain);
+
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(140, startTime);
+        osc.frequency.exponentialRampToValueAtTime(40, startTime + 0.15);
+
+        gain.gain.setValueAtTime(0.28, startTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, startTime + 0.2);
+
+        osc.start(startTime);
+        osc.stop(startTime + 0.22);
+      }
+
+      // ── Note frequencies (D major scale, romantic feel) ──────────────
+      // D3=146.83, E3=164.81, F#3=185, G3=196, A3=220, B3=246.94, D4=293.66
+      // D4=293.66, E4=329.63, F#4=369.99, G4=392, A4=440, B4=493.88, D5=587.33
+      const D4  = 293.66, E4 = 329.63, Fs4 = 369.99,
+            G4  = 392.00, A4 = 440.00, B4  = 493.88,
+            D5  = 587.33, E5 = 659.25, Fs5 = 739.99,
+            A3  = 220.00, D3 = 146.83, G3  = 196.00,
+            A2  = 110.00, D2 = 73.41;
+
+      // Pad chord sets [root, third, fifth, octave]
+      const chords = [
+        [D3, Fs4, A4, D5],   // D major
+        [A2, E4,  A4, Cs5 = 554.37],  // A major
+        [G3, B4,  D5, G4 ],  // G major
+        [A2, Cs5 = 554.37, E4, A4]    // A major
+      ];
+
+      // 8-bar melody — a gentle rising-falling phrase
+      const melody = [
+        // bar 1
+        { f: D4,  b: 0,    dur: 1.5 },
+        { f: E4,  b: 1.5,  dur: 0.5 },
+        { f: Fs4, b: 2,    dur: 1   },
+        { f: A4,  b: 3,    dur: 1   },
+        // bar 2
+        { f: B4,  b: 4,    dur: 2   },
+        { f: A4,  b: 6,    dur: 1   },
+        { f: Fs4, b: 7,    dur: 1   },
+        // bar 3
+        { f: G4,  b: 8,    dur: 1   },
+        { f: A4,  b: 9,    dur: 1   },
+        { f: D5,  b: 10,   dur: 2   },
+        // bar 4
+        { f: B4,  b: 12,   dur: 1.5 },
+        { f: A4,  b: 13.5, dur: 0.5 },
+        { f: G4,  b: 14,   dur: 2   },
+        // bar 5 — repeat with variation
+        { f: Fs4, b: 16,   dur: 1   },
+        { f: G4,  b: 17,   dur: 1   },
+        { f: A4,  b: 18,   dur: 1.5 },
+        { f: B4,  b: 19.5, dur: 0.5 },
+        // bar 6
+        { f: D5,  b: 20,   dur: 2   },
+        { f: A4,  b: 22,   dur: 1   },
+        { f: Fs4, b: 23,   dur: 1   },
+        // bar 7
+        { f: E4,  b: 24,   dur: 1   },
+        { f: Fs4, b: 25,   dur: 1   },
+        { f: A4,  b: 26,   dur: 1   },
+        { f: G4,  b: 27,   dur: 1   },
+        // bar 8 — resolve to D
+        { f: Fs4, b: 28,   dur: 1   },
+        { f: E4,  b: 29,   dur: 1   },
+        { f: D4,  b: 30,   dur: 2   },
+      ];
+
+      // ── Schedule one full loop starting at `t` ────────────────────────
+      function scheduleLoop(t) {
+        // Pad chords — 2 bars each
+        playPad(chords[0], t + BAR * 0, BAR * 2);
+        playPad(chords[1], t + BAR * 2, BAR * 2);
+        playPad(chords[2], t + BAR * 4, BAR * 2);
+        playPad(chords[3], t + BAR * 6, BAR * 2);
+
+        // Melody
+        melody.forEach(n => {
+          playNote(n.f, t + n.b * BEAT, n.dur * BEAT, 0.22, 'triangle');
+        });
+
+        // Bass notes on root of each chord change
+        playNote(D2,       t + BAR * 0, BAR, 0.14, 'sine');
+        playNote(A2 / 2,   t + BAR * 2, BAR, 0.14, 'sine');
+        playNote(G3 / 2,   t + BAR * 4, BAR, 0.14, 'sine');
+        playNote(A2 / 2,   t + BAR * 6, BAR, 0.14, 'sine');
+
+        // Soft kick on beats 1 and 3 of every bar
+        for (let bar = 0; bar < 8; bar++) {
+          playKick(t + bar * BAR);
+          playKick(t + bar * BAR + BEAT * 2);
+        }
+      }
+
+      // ── Loop scheduler — reschedules ~1 bar before the loop ends ─────
+      let loopStart = AC.currentTime + 0.1;
+      scheduleLoop(loopStart);
+
+      function scheduleNext() {
+        if (!bgmLoopActive) return; // BGM has been stopped — exit the loop
+
+        const elapsed    = AC.currentTime - loopStart;
+        const remaining  = LOOP_LEN - elapsed;
+
+        if (remaining < BAR) {                   // within 1 bar of the end
+          loopStart += LOOP_LEN;
+          scheduleLoop(loopStart);
+        }
+        // Check again every half-bar
+        setTimeout(scheduleNext, (BAR / 2) * 1000);
+      }
+
+      scheduleNext();
+    }
+
+    // Kick off BGM on first keypress (satisfies browser autoplay policy)
+    document.addEventListener('keydown', () => {
+      if (AC.state === 'running') startBGM();
+      else AC.resume().then(startBGM);
+    }, { once: true });
+
+    // Fade out and stop the BGM loop
+    function stopBGM() {
+      bgmLoopActive = false;
+      bgmStarted    = false; // allow restart on next game
+      if (bgmMasterGain) {
+        bgmMasterGain.gain.setValueAtTime(bgmMasterGain.gain.value, AC.currentTime);
+        bgmMasterGain.gain.linearRampToValueAtTime(0, AC.currentTime + 1.2);
+        bgmMasterGain = null;
+      }
+    }
+
+    // One-shot dramatic "GAME OVER" stinger — plays once, no loop
+    function playGameOverSound() {
+      // Low descending tone
+      const osc1  = AC.createOscillator();
+      const gain1 = AC.createGain();
+      osc1.connect(gain1); gain1.connect(AC.destination);
+      osc1.type = 'sawtooth';
+      osc1.frequency.setValueAtTime(440, AC.currentTime + 1.3);
+      osc1.frequency.linearRampToValueAtTime(110, AC.currentTime + 2.5);
+      gain1.gain.setValueAtTime(0, AC.currentTime + 1.3);
+      gain1.gain.linearRampToValueAtTime(0.35, AC.currentTime + 1.45);
+      gain1.gain.linearRampToValueAtTime(0, AC.currentTime + 2.6);
+      osc1.start(AC.currentTime + 1.3);
+      osc1.stop(AC.currentTime + 2.7);
+
+      // Two short low thuds
+      [0, 0.35].forEach(offset => {
+        const osc  = AC.createOscillator();
+        const gain = AC.createGain();
+        osc.connect(gain); gain.connect(AC.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(160, AC.currentTime + offset);
+        osc.frequency.exponentialRampToValueAtTime(50, AC.currentTime + offset + 0.25);
+        gain.gain.setValueAtTime(0.4, AC.currentTime + offset);
+        gain.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + offset + 0.28);
+        osc.start(AC.currentTime + offset);
+        osc.stop(AC.currentTime + offset + 0.3);
+      });
+    }
+
+    // Short laser "pew" — high-pitched square wave that drops quickly
+    function playShootSound() {
+      const osc  = AC.createOscillator();
+      const gain = AC.createGain();
+      osc.connect(gain);
+      gain.connect(AC.destination);
+
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(880, AC.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(220, AC.currentTime + 0.12);
+
+      gain.gain.setValueAtTime(0.18, AC.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.12);
+
+      osc.start(AC.currentTime);
+      osc.stop(AC.currentTime + 0.12);
+    }
+
+    // Explosion "boom" — white noise burst filtered through a lowpass
+    function playExplosionSound(big = false) {
+      const duration  = big ? 0.55 : 0.25;
+      const bufLen    = Math.ceil(AC.sampleRate * duration);
+      const buffer    = AC.createBuffer(1, bufLen, AC.sampleRate);
+      const data      = buffer.getChannelData(0);
+      for (let i = 0; i < bufLen; i++) data[i] = Math.random() * 2 - 1;
+
+      const src    = AC.createBufferSource();
+      const filter = AC.createBiquadFilter();
+      const gain   = AC.createGain();
+
+      src.buffer = buffer;
+      filter.type = 'lowpass';
+      filter.frequency.value = big ? 600 : 1200;
+
+      src.connect(filter);
+      filter.connect(gain);
+      gain.connect(AC.destination);
+
+      gain.gain.setValueAtTime(big ? 0.55 : 0.35, AC.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + duration);
+
+      src.start(AC.currentTime);
+      src.stop(AC.currentTime + duration);
+    }
+
+    // ── Stars ─────────────────────────────────────────────────────────────
+    // Generate a field of stars with random positions, sizes, and speeds
+    const stars = Array.from({ length: 120 }, () => ({
+      x: Math.random() * canvas.width,
+      y: Math.random() * canvas.height,
+      radius: Math.random() * 1.5 + 0.3,   // 0.3 – 1.8px
+      speed: Math.random() * 0.8 + 0.2,    // slow parallax drift downward
+      opacity: Math.random() * 0.6 + 0.4   // 0.4 – 1.0
+    }));
+
+    function updateStars() {
+      for (const star of stars) {
+        star.y += star.speed;
+        // Wrap back to the top when a star drifts off the bottom
+        if (star.y > canvas.height) {
+          star.y = 0;
+          star.x = Math.random() * canvas.width;
+        }
+      }
+    }
+
+    function drawStars() {
+      for (const star of stars) {
+        ctx.beginPath();
+        ctx.arc(star.x, star.y, star.radius, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 255, 255, ${star.opacity})`;
+        ctx.fill();
+      }
+    }
+
+    // ── Ship properties ───────────────────────────────────────────────────
+    const SHIP_NORMAL_W = 40;
+    const SHIP_NORMAL_H = 50;
+    const SHIP_BIG_W    = 80;  // 2x
+    const SHIP_BIG_H    = 100; // 2x
+    const BIG_SHIP_THRESHOLD = 25000; // 25 seconds in ms
+
+    let bigShip       = false;
+    let survivalStart = Date.now(); // reset each game
+
+    const ship = {
+      x: canvas.width / 2,
+      y: canvas.height - 60,
+      width:  SHIP_NORMAL_W,
+      height: SHIP_NORMAL_H,
+      speed: 5
+    };
+
+    function updateShipSize() {
+      const survived = Date.now() - survivalStart;
+      if (!bigShip && survived >= BIG_SHIP_THRESHOLD) {
+        bigShip      = true;
+        ship.width   = SHIP_BIG_W;
+        ship.height  = SHIP_BIG_H;
+        playBigShipSound();
+      }
+    }
+
+    function shrinkShip() {
+      bigShip      = false;
+      ship.width   = SHIP_NORMAL_W;
+      ship.height  = SHIP_NORMAL_H;
+    }
+
+    // ── Keyboard state ────────────────────────────────────────────────────
+    const keys = {};
+
+    document.addEventListener('keydown', e => {
+      keys[e.key] = true;
+      // Prevent the page from scrolling with arrow keys and spacebar
+      if (['ArrowLeft', 'ArrowRight', ' '].includes(e.key)) {
+        e.preventDefault();
+      }
+      // Difficulty selection via keyboard (1/2/3)
+      if (difficulty === null) {
+        if (e.key === '1') { applyDifficulty('easy');   survivalStart = Date.now(); lastBossTime = Date.now(); if (AC.state === 'running') startBGM(); else AC.resume().then(startBGM); }
+        if (e.key === '2') { applyDifficulty('medium'); survivalStart = Date.now(); lastBossTime = Date.now(); if (AC.state === 'running') startBGM(); else AC.resume().then(startBGM); }
+        if (e.key === '3') { applyDifficulty('hard');   survivalStart = Date.now(); lastBossTime = Date.now(); if (AC.state === 'running') startBGM(); else AC.resume().then(startBGM); }
+        return;
+      }
+      // Restart on R when game is over
+      if ((e.key === 'r' || e.key === 'R') && gameOver) {
+        resetGame();
+      }
+    });
+
+    document.addEventListener('keyup', e => {
+      keys[e.key] = false;
+    });
+
+    // ── Bullets ───────────────────────────────────────────────────────────
+    const bullets = [];
+    const BULLET_SPEED = 10;
+    const COOLDOWN_MS = 250;
+    let lastShotTime = 0;
+
+    function spawnBullet() {
+      const now = Date.now();
+      const cooldown = isRapidFire() ? RAPIDFIRE_BOOST : RAPIDFIRE_NORMAL;
+      if (now - lastShotTime < cooldown) return; // cooldown not elapsed
+      lastShotTime = now;
+
+      bullets.push({
+        x: ship.x,                        // horizontally centered on ship
+        y: ship.y - ship.height / 2,      // starts at the tip of the ship
+        width: 4,
+        height: 12
+      });
+
+      playShootSound();
+    }
+
+    function updateBullets() {
+      for (const bullet of bullets) {
+        bullet.y -= BULLET_SPEED;
+      }
+      // Remove bullets that have left the top of the canvas
+      for (let i = bullets.length - 1; i >= 0; i--) {
+        if (bullets[i].y + bullets[i].height < 0) {
+          bullets.splice(i, 1);
+        }
+      }
+    }
+
+    function drawBullets() {
+      ctx.fillStyle = '#ffee00';
+      ctx.shadowColor = '#ffaa00';
+      ctx.shadowBlur = 8;
+      for (const bullet of bullets) {
+        ctx.fillRect(
+          bullet.x - bullet.width / 2,
+          bullet.y,
+          bullet.width,
+          bullet.height
+        );
+      }
+      // Reset shadow so it doesn't bleed onto other shapes
+      ctx.shadowBlur = 0;
+    }
+
+    // ── Score & Lives ─────────────────────────────────────────────────────
+    let score = 0;
+    let lives = 3;
+    let gameOver = false;
+
+    function drawScore() {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 20px Arial';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText('Score: ' + score, 16, 16);
+    }
+
+    function drawLives() {
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 20px Arial';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'top';
+      ctx.fillText('Lives: ' + lives, canvas.width - 16, 16);
+    }
+
+    function drawLevel() {
+      ctx.fillStyle = '#ffdd44';
+      ctx.font = 'bold 20px Arial';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText('Level: ' + level, 16, 44);
+
+      // Small difficulty badge next to score
+      const diffColors = { easy: '#00cc55', medium: '#ffaa00', hard: '#ff4444' };
+      ctx.fillStyle = diffColors[difficulty] || '#ffffff';
+      ctx.font = 'bold 13px Arial';
+      ctx.fillText(difficulty ? difficulty.toUpperCase() : '', 130, 20);
+    }
+
+    function drawGameOver() {
+      // Semi-transparent dark overlay
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // "GAME OVER" in large red text
+      ctx.fillStyle = '#ff2222';
+      ctx.font = 'bold 72px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 60);
+
+      // Final score
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 32px Arial';
+      ctx.fillText('Final Score: ' + score, canvas.width / 2, canvas.height / 2 + 10);
+
+      // Restart prompt
+      ctx.fillStyle = '#aaaaaa';
+      ctx.font = '22px Arial';
+      ctx.fillText('Press R to Restart', canvas.width / 2, canvas.height / 2 + 65);
+    }
+
+    // Called whenever lives hit 0 — stops BGM, plays stinger, sets flag
+    function triggerGameOver() {
+      gameOver = true;
+      stopBGM();
+      playGameOverSound();
+    }
+
+    function resetGame() {
+      score = 0;
+      lives = 3;
+      gameOver  = false;
+      difficulty = null;  // go back to difficulty selection screen
+      level          = 1;
+      levelThreshold = 100;
+      bigShip       = false;
+      ship.width    = SHIP_NORMAL_W;
+      ship.height   = SHIP_NORMAL_H;
+      survivalStart = Date.now();
+      bullets.length = 0;
+      enemies.length = 0;
+      particles.length = 0;
+      powerups.length = 0;
+      rapidFireEnd    = 0;
+      lastPowerupTime = Date.now();
+      boss = null;
+      lastBossTime = Date.now();
+      ship.x = canvas.width / 2;
+      lastShotTime = 0;
+      lastSpawnTime = 0;
+      // BGM will restart when difficulty is chosen
+    }
+
+    // ── Particles ─────────────────────────────────────────────────────────
+    const particles = [];
+
+    // Spawn a burst of particles at (x, y) — the center of a destroyed enemy
+    function spawnParticles(x, y, big = false) {
+      const count = big ? 36 : 18;
+      const speedMax = big ? 5 : 3;
+      const speedMin = big ? 2 : 1.5;
+      for (let i = 0; i < count; i++) {
+        const angle = (Math.PI * 2 / count) * i + (Math.random() - 0.5) * 0.4;
+        const speed = Math.random() * speedMax + speedMin;
+        const hue = big
+          ? (Math.random() < 0.5 ? '#cc44ff' : '#ff44ff')  // purple tones for boss
+          : (Math.random() < 0.6  ? '#ff6600' : '#ff2200'); // orange/red for regulars
+        particles.push({
+          x,
+          y,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          radius: Math.random() * (big ? 5 : 3) + 1.5,
+          opacity: 1,
+          decay: Math.random() * 0.03 + (big ? 0.01 : 0.02),
+          color: hue
+        });
+      }
+    }
+
+    function updateParticles() {
+      for (const p of particles) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.05;      // slight gravity pull
+        p.opacity -= p.decay;
+      }
+      // Remove fully faded particles
+      for (let i = particles.length - 1; i >= 0; i--) {
+        if (particles[i].opacity <= 0) {
+          particles.splice(i, 1);
+        }
+      }
+    }
+
+    function drawParticles() {
+      for (const p of particles) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        // Build rgba from stored hex color + current opacity
+        ctx.fillStyle = p.color
+          .replace(')', `, ${p.opacity.toFixed(2)})`)
+          .replace('rgb', 'rgba')
+          // handle hex: convert to inline rgba string directly
+        ;
+        // Use globalAlpha for simplicity — no hex parsing needed
+        ctx.globalAlpha = Math.max(0, p.opacity);
+        ctx.fillStyle = p.color;
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1; // always restore
+    }
+
+    // ── Boss ──────────────────────────────────────────────────────────────
+    const BOSS_SIZE       = 80;
+    const BOSS_SPEED      = 1;
+    const BOSS_MAX_HP     = 5;
+    const BOSS_POINTS     = 50;
+    const BOSS_INTERVAL   = 30000; // spawn every 30 seconds
+    let boss              = null;  // null when no boss is on screen
+    let lastBossTime      = Date.now(); // track when to next spawn
+
+    function spawnBoss() {
+      boss = {
+        x:  canvas.width / 2 - BOSS_SIZE / 2, // centered horizontally
+        y:  -BOSS_SIZE,
+        size: BOSS_SIZE,
+        hp: BOSS_MAX_HP,
+        flashTimer: 0   // brief white flash when hit
+      };
+    }
+
+    function updateBoss() {
+      if (!boss) {
+        // Spawn a new boss if the interval has elapsed
+        if (Date.now() - lastBossTime >= BOSS_INTERVAL) {
+          spawnBoss();
+          lastBossTime = Date.now();
+        }
+        return;
+      }
+
+      boss.y += BOSS_SPEED;
+
+      if (boss.flashTimer > 0) boss.flashTimer--;
+
+      // Boss escapes the bottom — lose a life
+      if (boss.y > canvas.height) {
+        boss = null;
+        lives--;
+        if (lives <= 0) { lives = 0; triggerGameOver(); }
+      }
+    }
+
+    function drawBoss() {
+      if (!boss) return;
+
+      // Flash white briefly on hit, otherwise purple
+      const fill   = boss.flashTimer > 0 ? '#ffffff' : '#8800cc';
+      const stroke = boss.flashTimer > 0 ? '#ffffff' : '#cc44ff';
+
+      ctx.fillStyle = fill;
+      ctx.fillRect(boss.x, boss.y, boss.size, boss.size);
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(boss.x, boss.y, boss.size, boss.size);
+
+      // Health bar — drawn just above the boss
+      const barW = boss.size;
+      const barH = 8;
+      const barX = boss.x;
+      const barY = boss.y - 14;
+
+      // Background track
+      ctx.fillStyle = '#330033';
+      ctx.fillRect(barX, barY, barW, barH);
+
+      // Filled portion
+      const fillW = (boss.hp / BOSS_MAX_HP) * barW;
+      ctx.fillStyle = '#cc44ff';
+      ctx.fillRect(barX, barY, fillW, barH);
+
+      // Border
+      ctx.strokeStyle = '#ff88ff';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(barX, barY, barW, barH);
+    }
+
+    function checkBossCollisions() {
+      if (!boss) return;
+
+      const eLeft   = boss.x;
+      const eRight  = boss.x + boss.size;
+      const eTop    = boss.y;
+      const eBottom = boss.y + boss.size;
+
+      for (let bi = bullets.length - 1; bi >= 0; bi--) {
+        const b = bullets[bi];
+        const bLeft   = b.x - b.width / 2;
+        const bRight  = b.x + b.width / 2;
+        const bTop    = b.y;
+        const bBottom = b.y + b.height;
+
+        const hit = bRight > eLeft && bLeft < eRight &&
+                    bBottom > eTop && bTop < eBottom;
+
+        if (hit) {
+          bullets.splice(bi, 1); // consume the bullet
+          boss.hp--;
+          boss.flashTimer = 6;   // flash for 6 frames
+
+          if (boss.hp <= 0) {
+            spawnParticles(boss.x + boss.size / 2, boss.y + boss.size / 2, true);
+            playExplosionSound(true); // big boss explosion sound
+            score += BOSS_POINTS;
+            boss = null;
+            lastBossTime = Date.now(); // reset 30-second timer
+          }
+          break; // one bullet hits once
+        }
+      }
+    }
+
+    // ── Power-up ──────────────────────────────────────────────────────────
+    const POWERUP_RADIUS    = 14;
+    const POWERUP_SPEED     = 1.8;
+    const POWERUP_INTERVAL  = 20000; // spawn every 20 seconds
+    const RAPIDFIRE_NORMAL  = 250;   // ms — base cooldown
+    const RAPIDFIRE_BOOST   = 125;   // ms — half cooldown during power-up
+    const RAPIDFIRE_DURATION = 5000; // ms — how long rapid fire lasts
+
+    let powerups         = [];
+    let lastPowerupTime  = Date.now();
+    let rapidFireEnd     = 0;        // timestamp when rapid fire expires (0 = inactive)
+
+    // Convenience getter — true while rapid fire is active
+    function isRapidFire() { return Date.now() < rapidFireEnd; }
+
+    function spawnPowerup() {
+      const now = Date.now();
+      if (now - lastPowerupTime < POWERUP_INTERVAL) return;
+      lastPowerupTime = now;
+
+      powerups.push({
+        x: POWERUP_RADIUS + Math.random() * (canvas.width - POWERUP_RADIUS * 2),
+        y: -POWERUP_RADIUS,
+        pulse: 0   // phase for the glow pulse animation
+      });
+    }
+
+    function updatePowerups() {
+      for (const p of powerups) {
+        p.y     += POWERUP_SPEED;
+        p.pulse += 0.08;
+      }
+
+      for (let i = powerups.length - 1; i >= 0; i--) {
+        const p = powerups[i];
+
+        // Remove if it drifted off the bottom
+        if (p.y - POWERUP_RADIUS > canvas.height) {
+          powerups.splice(i, 1);
+          continue;
+        }
+
+        // Check if the ship overlaps the power-up (circle vs rect)
+        const shipLeft   = ship.x - ship.width;
+        const shipRight  = ship.x + ship.width;
+        const shipTop    = ship.y - ship.height / 2;
+        const shipBottom = ship.y + ship.height / 2;
+
+        const nearestX = Math.max(shipLeft,  Math.min(p.x, shipRight));
+        const nearestY = Math.max(shipTop,   Math.min(p.y, shipBottom));
+        const dx = p.x - nearestX;
+        const dy = p.y - nearestY;
+
+        if (dx * dx + dy * dy <= POWERUP_RADIUS * POWERUP_RADIUS) {
+          // Collected — activate rapid fire
+          rapidFireEnd = Date.now() + RAPIDFIRE_DURATION;
+          powerups.splice(i, 1);
+          playPowerupSound();
+        }
+      }
+    }
+
+    function drawPowerups() {
+      for (const p of powerups) {
+        const glow = 0.5 + 0.5 * Math.sin(p.pulse); // 0 – 1 oscillation
+
+        // Outer glow ring
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, POWERUP_RADIUS + 5 * glow, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(0, 255, 100, ${0.15 * glow})`;
+        ctx.fill();
+
+        // Main circle
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, POWERUP_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle = '#00cc55';
+        ctx.fill();
+        ctx.strokeStyle = '#aaffcc';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Lightning bolt symbol inside
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 14px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('⚡', p.x, p.y);
+      }
+    }
+
+    // Draw rapid-fire timer bar just below the HUD when active
+    function drawPowerupHUD() {
+      if (!isRapidFire()) return;
+
+      const remaining = rapidFireEnd - Date.now();
+      const fraction  = remaining / RAPIDFIRE_DURATION;
+      const barW      = 160;
+      const barH      = 10;
+      const barX      = canvas.width / 2 - barW / 2;
+      const barY      = 14;
+
+      // Background
+      ctx.fillStyle = '#003311';
+      ctx.fillRect(barX, barY, barW, barH);
+
+      // Filled portion
+      ctx.fillStyle = '#00ff66';
+      ctx.fillRect(barX, barY, barW * fraction, barH);
+
+      // Border
+      ctx.strokeStyle = '#aaffcc';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(barX, barY, barW, barH);
+
+      // Label
+      ctx.fillStyle = '#aaffcc';
+      ctx.font = 'bold 11px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText('RAPID FIRE', canvas.width / 2, barY + barH + 3);
+    }
+
+    // Big ship unlock sound — deep power-up boom + rising tone
+    function playBigShipSound() {
+      // Rising triumphant sweep
+      const osc  = AC.createOscillator();
+      const gain = AC.createGain();
+      osc.connect(gain); gain.connect(AC.destination);
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(220, AC.currentTime);
+      osc.frequency.linearRampToValueAtTime(880, AC.currentTime + 0.4);
+      gain.gain.setValueAtTime(0.28, AC.currentTime);
+      gain.gain.linearRampToValueAtTime(0, AC.currentTime + 0.5);
+      osc.start(AC.currentTime);
+      osc.stop(AC.currentTime + 0.5);
+
+      // Low bass thud underneath
+      const osc2  = AC.createOscillator();
+      const gain2 = AC.createGain();
+      osc2.connect(gain2); gain2.connect(AC.destination);
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(80, AC.currentTime);
+      osc2.frequency.exponentialRampToValueAtTime(30, AC.currentTime + 0.3);
+      gain2.gain.setValueAtTime(0.4, AC.currentTime);
+      gain2.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.35);
+      osc2.start(AC.currentTime);
+      osc2.stop(AC.currentTime + 0.4);
+    }
+
+    // Power-up collect sound — rising chime
+    function playPowerupSound() {      const osc  = AC.createOscillator();
+      const gain = AC.createGain();
+      osc.connect(gain);
+      gain.connect(AC.destination);
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(440, AC.currentTime);
+      osc.frequency.linearRampToValueAtTime(1320, AC.currentTime + 0.25);
+
+      gain.gain.setValueAtTime(0.25, AC.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + 0.3);
+
+      osc.start(AC.currentTime);
+      osc.stop(AC.currentTime + 0.3);
+    }
+
+    // ── Difficulty & Level ────────────────────────────────────────────────
+    // Difficulty presets: [base enemy speed, base spawn interval ms]
+    const DIFFICULTY_PRESETS = {
+      easy:   { speed: 1.2, interval: 1400 },
+      medium: { speed: 1.7, interval: 1100 },
+      hard:   { speed: 2.0, interval: 1000 }  // original "hard" values
+    };
+
+    let difficulty      = null;   // 'easy' | 'medium' | 'hard' — null = on menu
+    let level           = 1;
+    let levelThreshold  = 100;    // score needed for next level
+
+    // Live values — recalculated each level up
+    let enemySpeed      = 2;
+    let spawnInterval   = 1000;
+
+    function applyDifficulty(diff) {
+      difficulty    = diff;
+      level         = 1;
+      const p       = DIFFICULTY_PRESETS[diff];
+      enemySpeed    = p.speed;
+      spawnInterval = p.interval;
+      levelThreshold = 100;
+    }
+
+    function checkLevelUp() {
+      if (score >= levelThreshold) {
+        level++;
+        levelThreshold += 100;          // next level needs another 100 pts
+        enemySpeed    = parseFloat((enemySpeed + 0.3).toFixed(2));
+        spawnInterval = Math.max(300, spawnInterval - 80); // floor at 300ms
+        playLevelUpSound();
+      }
+    }
+
+    function playLevelUpSound() {
+      [0, 0.12, 0.24].forEach((offset, i) => {
+        const osc  = AC.createOscillator();
+        const gain = AC.createGain();
+        osc.connect(gain); gain.connect(AC.destination);
+        osc.type = 'square';
+        osc.frequency.value = [523, 659, 784][i]; // C5, E5, G5
+        gain.gain.setValueAtTime(0.15, AC.currentTime + offset);
+        gain.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + offset + 0.18);
+        osc.start(AC.currentTime + offset);
+        osc.stop(AC.currentTime + offset + 0.2);
+      });
+    }
+
+    // ── Difficulty selection screen ───────────────────────────────────────
+    const DIFF_BUTTONS = [
+      { label: 'EASY',   key: 'easy',   color: '#00cc55', x: 0, y: 0, w: 200, h: 60 },
+      { label: 'MEDIUM', key: 'medium', color: '#ffaa00', x: 0, y: 0, w: 200, h: 60 },
+      { label: 'HARD',   key: 'hard',   color: '#ff2222', x: 0, y: 0, w: 200, h: 60 },
+    ];
+
+    // Position buttons dynamically based on canvas size
+    function layoutButtons() {
+      const cx = canvas.width / 2;
+      const startY = canvas.height / 2 - 30;
+      const gap = 90;
+      DIFF_BUTTONS[0].x = cx - 100; DIFF_BUTTONS[0].y = startY - gap;
+      DIFF_BUTTONS[1].x = cx - 100; DIFF_BUTTONS[1].y = startY;
+      DIFF_BUTTONS[2].x = cx - 100; DIFF_BUTTONS[2].y = startY + gap;
+    }
+    layoutButtons();
+
+    function drawDifficultyScreen() {
+      // Background
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Stars still scroll in bg
+      drawStars();
+
+      // Title
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 48px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('SELECT DIFFICULTY', canvas.width / 2, canvas.height / 2 - 210);
+
+      // Subtitle descriptions
+      const descs = [
+        'Slow enemies — chill mode',
+        'Balanced speed — normal challenge',
+        'Fast enemies — maximum danger'
+      ];
+
+      DIFF_BUTTONS.forEach((btn, i) => {
+        // Button shadow
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.fillRect(btn.x + 4, btn.y + 4, btn.w, btn.h);
+
+        // Button fill
+        ctx.fillStyle = btn.color;
+        ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+
+        // Button border
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+
+        // Label
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 22px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h / 2);
+
+        // Description below button
+        ctx.fillStyle = '#aaaaaa';
+        ctx.font = '14px Arial';
+        ctx.fillText(descs[i], btn.x + btn.w / 2, btn.y + btn.h + 16);
+      });
+
+      // Keyboard hint
+      ctx.fillStyle = '#555555';
+      ctx.font = '14px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('or press  1 = Easy   2 = Medium   3 = Hard', canvas.width / 2, canvas.height - 40);
+    }
+
+    // Mouse click on difficulty buttons
+    canvas.addEventListener('click', e => {
+      if (difficulty !== null) return; // already in game
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      DIFF_BUTTONS.forEach(btn => {
+        if (mx >= btn.x && mx <= btn.x + btn.w &&
+            my >= btn.y && my <= btn.y + btn.h) {
+          applyDifficulty(btn.key);
+          survivalStart = Date.now();
+          lastBossTime  = Date.now();
+          if (AC.state === 'running') startBGM();
+          else AC.resume().then(startBGM);
+        }
+      });
+    });
+
+    // ── Enemies ───────────────────────────────────────────────────────────
+    const enemies = [];
+    const ENEMY_SIZE = 36;
+    let lastSpawnTime = 0;
+
+    function spawnEnemy() {
+      const now = Date.now();
+      if (now - lastSpawnTime < spawnInterval) return;  // uses live spawnInterval
+      lastSpawnTime = now;
+
+      enemies.push({
+        x: Math.random() * (canvas.width - ENEMY_SIZE),
+        y: -ENEMY_SIZE,
+        size: ENEMY_SIZE
+      });
+    }
+
+    function updateEnemies() {
+      for (const enemy of enemies) {
+        enemy.y += enemySpeed;   // uses live enemySpeed
+      }
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        if (enemies[i].y > canvas.height) {
+          enemies.splice(i, 1);
+          lives--;
+          if (lives <= 0) { lives = 0; triggerGameOver(); }
+        }
+      }
+    }
+
+    function drawEnemies() {
+      for (const enemy of enemies) {
+        // Red fill with a darker red border
+        ctx.fillStyle = '#cc0000';
+        ctx.fillRect(enemy.x, enemy.y, enemy.size, enemy.size);
+        ctx.strokeStyle = '#ff4444';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(enemy.x, enemy.y, enemy.size, enemy.size);
+      }
+    }
+
+    // ── Enemy hits ship ───────────────────────────────────────────────────
+    // If an enemy overlaps the ship, it gets destroyed, the ship shrinks
+    // (if big), or the player loses a life (if normal size).
+    function checkEnemyShipCollisions() {
+      const sLeft   = ship.x - ship.width;
+      const sRight  = ship.x + ship.width;
+      const sTop    = ship.y - ship.height / 2;
+      const sBottom = ship.y + ship.height / 2;
+
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        const e = enemies[i];
+        const overlap = e.x < sRight && e.x + e.size > sLeft &&
+                        e.y < sBottom && e.y + e.size > sTop;
+
+        if (overlap) {
+          spawnParticles(e.x + e.size / 2, e.y + e.size / 2);
+          playExplosionSound();
+          enemies.splice(i, 1);
+
+          if (bigShip) {
+            // Big ship absorbs the hit and reverts to normal size
+            shrinkShip();
+          } else {
+            lives--;
+            if (lives <= 0) { lives = 0; triggerGameOver(); }
+          }
+        }
+      }
+    }
+
+    // ── Survival HUD ──────────────────────────────────────────────────────
+    function drawSurvivalHUD() {
+      const survived  = Date.now() - survivalStart;
+      const cx        = canvas.width / 2;
+
+      if (bigShip) {
+        // Pulsing "BIG SHIP" label centred below rapid-fire bar
+        const pulse = 0.7 + 0.3 * Math.sin(Date.now() / 200);
+        ctx.globalAlpha = pulse;
+        ctx.fillStyle   = '#00eeff';
+        ctx.font        = 'bold 14px Arial';
+        ctx.textAlign   = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillText('★ BIG SHIP ACTIVE ★', cx, 42);
+        ctx.globalAlpha = 1;
+      } else {
+        // Progress bar counting up to 25 s
+        const fraction = Math.min(survived / BIG_SHIP_THRESHOLD, 1);
+        const barW = 180;
+        const barH = 10;
+        const barX = cx - barW / 2;
+        const barY = 14;
+
+        // Track
+        ctx.fillStyle = '#001a33';
+        ctx.fillRect(barX, barY, barW, barH);
+
+        // Fill — cyan
+        ctx.fillStyle = '#00ccff';
+        ctx.fillRect(barX, barY, barW * fraction, barH);
+
+        // Border
+        ctx.strokeStyle = '#0088cc';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(barX, barY, barW, barH);
+
+        // Label
+        ctx.fillStyle = '#88ddff';
+        ctx.font = 'bold 11px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const secsLeft = Math.ceil((BIG_SHIP_THRESHOLD - survived) / 1000);
+        ctx.fillText(`BIG SHIP in ${secsLeft}s`, cx, barY + barH + 3);
+      }
+    }
+
+    // ── Collision detection ───────────────────────────────────────────────
+    // Returns true if a bullet rectangle overlaps an enemy rectangle
+    function bulletHitsEnemy(bullet, enemy) {
+      const bLeft   = bullet.x - bullet.width / 2;
+      const bRight  = bullet.x + bullet.width / 2;
+      const bTop    = bullet.y;
+      const bBottom = bullet.y + bullet.height;
+
+      const eLeft   = enemy.x;
+      const eRight  = enemy.x + enemy.size;
+      const eTop    = enemy.y;
+      const eBottom = enemy.y + enemy.size;
+
+      return bRight > eLeft && bLeft < eRight &&
+             bBottom > eTop && bTop < eBottom;
+    }
+
+    function checkCollisions() {
+      // Iterate backwards so splicing doesn't skip elements
+      for (let ei = enemies.length - 1; ei >= 0; ei--) {
+        for (let bi = bullets.length - 1; bi >= 0; bi--) {
+          if (bulletHitsEnemy(bullets[bi], enemies[ei])) {
+            // Spawn explosion at the center of the enemy
+            const e = enemies[ei];
+            spawnParticles(e.x + e.size / 2, e.y + e.size / 2);
+            bullets.splice(bi, 1);  // remove bullet
+            enemies.splice(ei, 1);  // remove enemy
+            score += 10;            // award points
+            playExplosionSound();   // normal explosion sound
+            break; // this enemy is gone, move to next enemy
+          }
+        }
+      }
+    }
+
+    // ── Draw the ship as a cyan/blue upward-pointing triangle ─────────────
+    function drawShip() {
+      ctx.beginPath();
+      // Tip (top center)
+      ctx.moveTo(ship.x, ship.y - ship.height / 2);
+      // Bottom-left corner
+      ctx.lineTo(ship.x - ship.width, ship.y + ship.height / 2);
+      // Bottom-right corner
+      ctx.lineTo(ship.x + ship.width, ship.y + ship.height / 2);
+      ctx.closePath();
+
+      // Fill with a cyan/blue gradient
+      const gradient = ctx.createLinearGradient(
+        ship.x, ship.y - ship.height / 2,
+        ship.x, ship.y + ship.height / 2
+      );
+      gradient.addColorStop(0, '#00eeff');
+      gradient.addColorStop(1, '#0055ff');
+
+      ctx.fillStyle = gradient;
+      ctx.fill();
+
+      // Bright cyan outline
+      ctx.strokeStyle = '#00ffff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // ── Update: move ship based on held keys, clamp to canvas ─────────────
+    function update() {
+      if (difficulty === null) return; // waiting on difficulty screen
+      if (gameOver) return;
+
+      if (keys['ArrowLeft']) {
+        ship.x -= ship.speed;
+      }
+      if (keys['ArrowRight']) {
+        ship.x += ship.speed;
+      }
+
+      ship.x = Math.max(ship.width, Math.min(canvas.width - ship.width, ship.x));
+
+      if (keys[' ']) {
+        spawnBullet();
+      }
+
+      updateBullets();
+      spawnEnemy();
+      updateEnemies();
+      checkCollisions();
+      checkEnemyShipCollisions();
+      updateShipSize();
+      checkLevelUp();
+      updateBoss();
+      checkBossCollisions();
+      spawnPowerup();
+      updatePowerups();
+      updateParticles();
+      updateStars();
+    }
+
+    // ── Draw: clear canvas then render everything ─────────────────────────
+    function draw() {
+      // Show difficulty menu before game starts
+      if (difficulty === null) {
+        updateStars(); // keep stars drifting in background of menu
+        drawDifficultyScreen();
+        return;
+      }
+
+      ctx.fillStyle = '#000000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      drawStars();
+      drawParticles();
+      drawPowerups();
+      drawBullets();
+      drawEnemies();
+      drawBoss();
+      drawShip();
+      drawScore();
+      drawLives();
+      drawLevel();
+      drawPowerupHUD();
+      drawSurvivalHUD();
+
+      if (gameOver) {
+        drawGameOver();
+      }
+    }
+
+    // ── Game loop ─────────────────────────────────────────────────────────
+    function gameLoop() {
+      update();
+      draw();
+      requestAnimationFrame(gameLoop);
+    }
+
+    // Kick off the loop
+    gameLoop();
+  </script>
+</body>
+</html>
